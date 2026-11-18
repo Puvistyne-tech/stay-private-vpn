@@ -1,0 +1,128 @@
+name: Build and release
+
+# Every push to main that changes more than documentation is tested, built into a
+# DMG and published as a GitHub release tagged v<major>.<minor>.<commit count>.
+# <major>.<minor> comes from the VERSION file. Pull requests only run the tests.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+  workflow_dispatch:
+
+# One run per branch at a time, so two quick pushes cannot race to publish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: swift --version
+
+      - name: Unit tests
+        run: swift test
+
+      - name: Helper tests
+        run: ./Tests/helper-tests.sh
+
+      - name: Shell script syntax
+        run: |
+          for script in helper/stayvpn-helper scripts/*.sh Tests/*.sh; do
+            bash -n "$script" && echo "ok  $script"
+          done
+
+  release:
+    name: Build DMG and publish release
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the full history is needed to count commits
+
+      - name: Work out the version
+        id: version
+        run: |
+          base=$(tr -d '[:space:]' < VERSION)
+          count=$(git rev-list --count HEAD)
+          echo "version=$base.$count" >> "$GITHUB_OUTPUT"
+          echo "tag=v$base.$count" >> "$GITHUB_OUTPUT"
+          echo "build=$count" >> "$GITHUB_OUTPUT"
+          echo "Version: $base.$count"
+
+      - name: Build the DMG (Apple Silicon and Intel)
+        env:
+          STAYPRIVATE_VERSION: ${{ steps.version.outputs.version }}
+          STAYPRIVATE_BUILD: ${{ steps.version.outputs.build }}
+          STAYPRIVATE_UNIVERSAL: '1'
+        run: ./scripts/build-dmg.sh
+
+      - name: Name the DMG and write its checksum
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cp "build/Stay Private.dmg" "build/StayPrivate-$VERSION.dmg"
+          (cd build && shasum -a 256 "StayPrivate-$VERSION.dmg" > "StayPrivate-$VERSION.dmg.sha256")
+          sed "s/__VERSION__/$VERSION/g" .github/release-notes.md > build/release-notes.md
+          cat "build/StayPrivate-$VERSION.dmg.sha256"
+
+      - name: Check the DMG
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          hdiutil verify "build/StayPrivate-$VERSION.dmg"
+          mount=$(mktemp -d)
+          hdiutil attach "build/StayPrivate-$VERSION.dmg" -nobrowse -readonly -mountpoint "$mount" >/dev/null
+          app="$mount/Stay Private.app"
+          lipo -info "$app/Contents/MacOS/StayPrivate"
+          codesign --verify --verbose "$app"
+          found=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$app/Contents/Info.plist")
+          hdiutil detach "$mount" >/dev/null
+          test "$found" = "$VERSION" || { echo "App says version $found, expected $VERSION"; exit 1; }
+
+      - name: Keep the DMG as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: StayPrivate-${{ steps.version.outputs.version }}
+          path: |
+            build/StayPrivate-*.dmg
+            build/StayPrivate-*.dmg.sha256
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          files=("build/StayPrivate-$VERSION.dmg" "build/StayPrivate-$VERSION.dmg.sha256")
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # A re-run of the same commit: replace the files instead of failing.
+            gh release upload "$TAG" "${files[@]}" --clobber
+          else
+            gh release create "$TAG" "${files[@]}" \
+              --target "$GITHUB_SHA" \
+              --title "Stay Private $VERSION" \
+              --notes-file build/release-notes.md \
+              --generate-notes
+          fi

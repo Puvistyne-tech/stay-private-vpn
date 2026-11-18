@@ -1,0 +1,327 @@
+#!/bin/bash
+# Stay Private root helper. Installed root-owned at /usr/local/libexec/stayvpn-helper
+# and run by the app through `sudo -n`. It is the only thing the app may run as
+# root, so every argument is checked and no config may carry shell hooks.
+#
+#   stayvpn-helper version                  helper version number
+#   stayvpn-helper list                     profile names, one per line
+#   stayvpn-helper status                   key=value block per active tunnel
+#   stayvpn-helper up <profile>             connect (disconnects any other profile first)
+#   stayvpn-helper down <profile>           disconnect and restore DNS
+#   stayvpn-helper import <profile> <file>  validate and store a WireGuard config
+#   stayvpn-helper remove <profile>         disconnect and delete a profile
+#   stayvpn-helper repair                   restore DNS settings left behind by a VPN
+#
+# Exit codes: 0 ok, 1 failure, 2 bad input, 3 WireGuard tools not installed.
+
+set -euo pipefail
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+umask 077
+
+VERSION=2
+CONF_DIR=/etc/wireguard
+RUN_DIR=/var/run/wireguard
+STATE_DIR=/var/db/stayvpn
+DNS_SNAPSHOT=$STATE_DIR/dns.saved
+LOCK=/var/run/stayvpn.lock
+PREFIX=sv-
+MAX_BYTES=65536
+DRY=0
+HAVE_LOCK=0
+
+die() { echo "error: $1" >&2; exit "${2:-1}"; }
+
+if [ "$(id -u)" -ne 0 ]; then
+    # Not root: only usable for testing the file handling against a scratch
+    # directory. Nothing privileged can happen in this mode.
+    [ -n "${STAYVPN_TEST_DIR:-}" ] || die "must be run as root (the app uses sudo)"
+    CONF_DIR="$STAYVPN_TEST_DIR"
+    RUN_DIR="$STAYVPN_TEST_DIR/run"
+    DRY=1
+fi
+
+valid_name() { [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,10}[a-z0-9])?$ ]]; }
+
+need_name() {
+    [ $# -ge 1 ] || die "missing profile name" 2
+    valid_name "$1" || die "invalid profile name (use a-z, 0-9 and '-', 12 characters at most)" 2
+}
+
+need_tools() {
+    [ "$DRY" -eq 1 ] && die "cannot change tunnels in test mode" 2
+    command -v wg-quick >/dev/null 2>&1 && command -v wg >/dev/null 2>&1 \
+        || die "WireGuard tools not installed (brew install wireguard-tools)" 3
+}
+
+conf_path() { echo "$CONF_DIR/$PREFIX$1.conf"; }
+
+# Only one tunnel change at a time; `status` leaves DNS alone while one is running.
+take_lock() {
+    local i
+    for i in $(seq 1 40); do
+        if mkdir "$LOCK" 2>/dev/null; then
+            HAVE_LOCK=1
+            trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+            return 0
+        fi
+        sleep 0.25
+    done
+    # A lock this old was left by a helper that was killed; take it over.
+    HAVE_LOCK=1
+    trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+}
+
+# Prints the utun interface of an active profile, or returns 1.
+active_iface() {
+    local namefile="$RUN_DIR/$PREFIX$1.name" iface
+    [ -f "$namefile" ] || return 1
+    iface=$(cat "$namefile")
+    [[ "$iface" =~ ^utun[0-9]+$ ]] || return 1
+    wg show "$iface" >/dev/null 2>&1 || return 1
+    echo "$iface"
+}
+
+any_active() {
+    local profile
+    for profile in $(each_profile); do
+        active_iface "$profile" >/dev/null && return 0
+    done
+    return 1
+}
+
+each_profile() {
+    local f name
+    for f in "$CONF_DIR/$PREFIX"*.conf; do
+        [ -f "$f" ] || continue
+        name=$(basename "$f" .conf)
+        name=${name#"$PREFIX"}
+        valid_name "$name" && echo "$name"
+    done
+    return 0
+}
+
+# ---- DNS ------------------------------------------------------------------
+# wg-quick points every network service at the VPN's DNS server and is meant to
+# put the old values back on disconnect. That restore is done later by a
+# background process and is unreliable (it can save the VPN's DNS as the
+# "original"), which leaves the Mac unable to resolve names after disconnecting.
+# So the helper keeps its own snapshot and restores it itself.
+
+services() { networksetup -listallnetworkservices 2>/dev/null | tail -n +2 | sed 's/^\*//'; }
+
+# Current setting as space-separated values, or "Empty" when none is set.
+get_setting() {  # $1 = -getdnsservers | -getsearchdomains, $2 = service
+    local out
+    out=$(networksetup "$1" "$2" 2>/dev/null </dev/null) || { echo Empty; return; }
+    case "$out" in
+        ""|*" "*) echo Empty ;;   # "There aren't any ... set on X."
+        *) echo "$out" | tr '\n' ' ' | sed 's/ *$//' ;;
+    esac
+}
+
+# Every DNS server named in any saved profile, one per line.
+vpn_dns() {
+    cat "$CONF_DIR/$PREFIX"*.conf 2>/dev/null | tr -d '\r' \
+        | sed -n 's/^[[:space:]]*[Dd][Nn][Ss][[:space:]]*=//p' \
+        | tr ',' '\n' | tr -d ' \t' | grep -E '^[0-9a-fA-F:.]+$' || true
+}
+
+# True when every server in "$1" is one of the VPN DNS servers in "$2".
+is_vpn_dns() {
+    local server
+    [ "$1" != "Empty" ] && [ -n "$1" ] || return 1
+    for server in $1; do
+        echo "$2" | grep -qxF "$server" || return 1
+    done
+    return 0
+}
+
+snapshot_dns() {
+    [ -f "$DNS_SNAPSHOT" ] && return 0   # an earlier snapshot is still waiting to be restored
+    local list service dns search
+    list=$(vpn_dns)
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+    : > "$DNS_SNAPSHOT.tmp"
+    while read -r service; do
+        [ -n "$service" ] || continue
+        dns=$(get_setting -getdnsservers "$service")
+        # Never record a VPN's DNS as the original: fall back to automatic.
+        is_vpn_dns "$dns" "$list" && dns=Empty
+        search=$(get_setting -getsearchdomains "$service")
+        printf '%s\t%s\t%s\n' "$service" "$dns" "$search" >> "$DNS_SNAPSHOT.tmp"
+    done < <(services)
+    mv -f "$DNS_SNAPSHOT.tmp" "$DNS_SNAPSHOT"
+}
+
+restore_dns() {
+    local list service dns search
+    local dns_ok='^[0-9a-fA-F:. ]+$' search_ok='^[A-Za-z0-9. -]+$'
+    if [ -f "$DNS_SNAPSHOT" ]; then
+        while IFS=$'\t' read -r service dns search; do
+            [ -n "$service" ] || continue
+            [[ "$dns" =~ $dns_ok ]] || dns=Empty
+            [[ "$search" =~ $search_ok ]] || search=Empty
+            # shellcheck disable=SC2086  # values are space-separated lists
+            networksetup -setdnsservers "$service" $dns >/dev/null 2>&1 </dev/null || true
+            # shellcheck disable=SC2086
+            networksetup -setsearchdomains "$service" $search >/dev/null 2>&1 </dev/null || true
+        done < "$DNS_SNAPSHOT"
+        rm -f "$DNS_SNAPSHOT"
+    fi
+    # Whatever the snapshot said, no service may be left on a VPN DNS server.
+    list=$(vpn_dns)
+    while read -r service; do
+        [ -n "$service" ] || continue
+        if is_vpn_dns "$(get_setting -getdnsservers "$service")" "$list"; then
+            networksetup -setdnsservers "$service" Empty >/dev/null 2>&1 </dev/null || true
+        fi
+    done < <(services)
+    dscacheutil -flushcache >/dev/null 2>&1 || true
+    killall -HUP mDNSResponder >/dev/null 2>&1 || true
+}
+
+# wg-quick leaves a background monitor that rewrites DNS when it exits. Wait
+# for it to go (stopping it if it lingers) so that our restore has the last word.
+wait_monitor() {
+    local pattern="wg-quick up $CONF_DIR/$PREFIX$1.conf" i
+    for i in $(seq 1 10); do
+        pgrep -f "$pattern" >/dev/null 2>&1 || return 0
+        sleep 0.5
+    done
+    pkill -TERM -f "$pattern" >/dev/null 2>&1 || true
+    sleep 1
+    pkill -KILL -f "$pattern" >/dev/null 2>&1 || true
+}
+
+# Takes one profile's tunnel down. Returns 1 if wg-quick failed.
+tunnel_down() {
+    local conf result=0
+    conf=$(conf_path "$1")
+    if [ -f "$RUN_DIR/$PREFIX$1.name" ]; then
+        wg-quick down "$conf" >&2 || result=1
+    fi
+    wait_monitor "$1"
+    return $result
+}
+
+# ---- Commands -------------------------------------------------------------
+
+cmd_version() { echo "$VERSION"; }
+
+cmd_list() { each_profile; }
+
+cmd_status() {
+    command -v wg >/dev/null 2>&1 || return 0
+    local profile iface found=0
+    for profile in $(each_profile); do
+        iface=$(active_iface "$profile") || continue
+        found=1
+        # `wg show <if> dump`: line 1 is the interface (holds the private key, so it
+        # is never printed); line 2 is the peer.
+        wg show "$iface" dump | awk -F'\t' -v p="$profile" 'NR==2 {
+            print "profile=" p; print "endpoint=" $3; print "handshake=" $5
+            print "rx=" $6; print "tx=" $7; print "--" }'
+    done
+    # Self-heal: a snapshot with no tunnel means the VPN ended without a clean
+    # disconnect (crash, reboot), so DNS is still pointing at the VPN.
+    if [ "$DRY" -eq 0 ] && [ "$found" -eq 0 ] && [ -f "$DNS_SNAPSHOT" ] && [ ! -d "$LOCK" ] \
+        && ! pgrep -f "wg-quick up $CONF_DIR/$PREFIX" >/dev/null 2>&1; then
+        restore_dns
+    fi
+}
+
+cmd_down() {
+    need_name "$@"; need_tools
+    [ -f "$(conf_path "$1")" ] || die "no profile named '$1'" 2
+    take_lock
+    local failed=0
+    tunnel_down "$1" || failed=1
+    any_active || restore_dns
+    [ "$failed" -eq 0 ] || die "could not disconnect '$1'"
+}
+
+cmd_up() {
+    need_name "$@"; need_tools
+    local conf other; conf=$(conf_path "$1")
+    [ -f "$conf" ] || die "no profile named '$1'" 2
+    take_lock
+    for other in $(each_profile); do
+        [ "$other" = "$1" ] && continue
+        if [ -f "$RUN_DIR/$PREFIX$other.name" ]; then tunnel_down "$other" || true; fi
+    done
+    if active_iface "$1" >/dev/null; then return 0; fi
+    # A stale name file is left behind after a crash or sleep; clear it first.
+    if [ -f "$RUN_DIR/$PREFIX$1.name" ]; then tunnel_down "$1" >/dev/null 2>&1 || true; fi
+    # Start from clean DNS so the snapshot (and wg-quick's own copy) is the real original.
+    restore_dns
+    snapshot_dns
+    if ! wg-quick up "$conf" >&2; then
+        wait_monitor "$1"
+        restore_dns
+        die "could not connect '$1' (see details above)"
+    fi
+}
+
+cmd_repair() {
+    [ "$DRY" -eq 1 ] && die "cannot change DNS in test mode" 2
+    take_lock
+    any_active && die "disconnect first" 2
+    restore_dns
+}
+
+cmd_import() {
+    need_name "$@"
+    [ $# -ge 2 ] || die "missing config file" 2
+    local src="$2" dest size
+    [ -f "$src" ] && [ ! -L "$src" ] || die "config file not found" 2
+    size=$(wc -c < "$src" | tr -d ' ')
+    [ "$size" -gt 0 ] && [ "$size" -le "$MAX_BYTES" ] || die "config file is empty or too large" 2
+
+    local text; text=$(tr -d '\r' < "$src")
+    if echo "$text" | grep -Eiq '^[[:space:]]*(PreUp|PostUp|PreDown|PostDown|SaveConfig)[[:space:]]*='; then
+        die "config contains a PreUp/PostUp/PreDown/PostDown/SaveConfig line, which is not allowed" 2
+    fi
+    echo "$text" | grep -Eiq '^[[:space:]]*\[Interface\]' || die "not a WireGuard config ([Interface] missing)" 2
+    echo "$text" | grep -Eiq '^[[:space:]]*\[Peer\]' || die "not a WireGuard config ([Peer] missing)" 2
+    echo "$text" | grep -Eiq '^[[:space:]]*PrivateKey[[:space:]]*=' || die "config has no PrivateKey" 2
+    echo "$text" | grep -Eiq '^[[:space:]]*Endpoint[[:space:]]*=' || die "config has no Endpoint" 2
+
+    mkdir -p "$CONF_DIR"
+    chmod 700 "$CONF_DIR"
+    dest=$(conf_path "$1")
+    if [ "$DRY" -eq 0 ] && [ -f "$RUN_DIR/$PREFIX$1.name" ]; then
+        die "disconnect '$1' before replacing its config" 2
+    fi
+    printf '%s\n' "$text" > "$dest.tmp"
+    chmod 600 "$dest.tmp"
+    mv -f "$dest.tmp" "$dest"
+}
+
+cmd_remove() {
+    need_name "$@"
+    local conf; conf=$(conf_path "$1")
+    [ -f "$conf" ] || die "no profile named '$1'" 2
+    if [ "$DRY" -eq 0 ] && [ -f "$RUN_DIR/$PREFIX$1.name" ]; then
+        need_tools
+        take_lock
+        tunnel_down "$1" || true
+        # Restore while this profile's DNS is still known as a VPN DNS.
+        any_active || restore_dns
+    fi
+    rm -f "$conf"
+}
+
+[ $# -ge 1 ] || die "usage: stayvpn-helper version|list|status|up|down|import|remove|repair" 2
+command=$1; shift
+case "$command" in
+    version) cmd_version ;;
+    list)    cmd_list ;;
+    status)  cmd_status ;;
+    up)      cmd_up "$@" ;;
+    down)    cmd_down "$@" ;;
+    import)  cmd_import "$@" ;;
+    remove)  cmd_remove "$@" ;;
+    repair)  cmd_repair ;;
+    *)       die "unknown command '$command'" 2 ;;
+esac
